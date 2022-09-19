@@ -1,0 +1,407 @@
+---
+title: "Jacob Dean report"
+output: html_notebook
+---
+I will be using the Tennis Major Tournament Match Statistics Data Set available on the UCI machine learning repository.
+
+https://archive.ics.uci.edu/ml/datasets/Tennis+Major+Tournament+Match+Statistics#
+
+The goal is to create classification models. The model will restrict the variables to averages that approximately mirror the data available after the first set only. This will allow a predictive model to be created that predicts which player won before the final result is known and could have numerous practical applications. For example the model could be used by tennis coaches to analyse the factors that increase the probability of winning the most or could be used for in-game betting on the final result after the first set.
+
+Of course, this model will be constrained by the limitations of this dataset. First of all, it would have been much better to have the true data from only the first set rather than having to estimate it via averages from the whole match. Secondly, the data is from 6 years ago and it is possible that playing styles will have changed since then so the model may not be representative of tennis in 2019 and hence may lead to bad prediction and inference. Finally, the data is only from grand slams so there is the question of whether the game style is the same for smaller tournaments and hence whether the model could be realistically applied to these circumstances.
+
+We begin by loading all additional packages that will be used throughout this investigation
+```{r}
+library(tidyverse)
+library(MASS)
+library(tree)
+library(randomForest)
+library(corrplot)
+library(caret)
+library(e1071)
+library(gbm)
+```
+Then we load the raw datasets from the individual grand slams.
+```{r}
+aom<-read.csv("AusOpen-men-2013.csv")
+aow<-read.csv("AusOpen-women-2013.csv")
+fom<-read.csv("FrenchOpen-men-2013.csv")
+fow<-read.csv("FrenchOpen-women-2013.csv")
+uom<-read.csv("USOpen-men-2013.csv")
+uow<-read.csv("USOpen-women-2013.csv")
+wm<-read.csv("Wimbledon-men-2013.csv")
+ww<-read.csv("Wimbledon-women-2013.csv")
+```
+It would be great to have a single, larger data frame to work with so let's first add two columns to each smaller data frame. These will tell us the name of the grand slam each match was part of and the gender of the competitors.
+```{r}
+aom<-mutate(aom,Gender="Male",Slam="Australian")
+aow<-mutate(aow,Gender="Female",Slam="Australian")
+fom<-mutate(fom,Gender="Male",Slam="French")
+fow<-mutate(fow,Gender="Female",Slam="French")
+uom<-mutate(uom,Gender="Male",Slam="US")
+uow<-mutate(uow,Gender="Female",Slam="US")
+wm<-mutate(wm,Gender="Male",Slam="Wimbledon")
+ww<-mutate(ww,Gender="Female",Slam="Wimbledon")
+```
+Unfortunately there are some slight variations in the naming of columns. After creating an 8 by 44 matrix of column names to ensure that the columns of each dataset are in the same order, we take the names of the first data frame and copy them into all the other data frames.
+```{r}
+names(aow)<-names(aom)
+names(fom)<-names(aom)
+names(fow)<-names(aom)
+names(uom)<-names(aom)
+names(uow)<-names(aom)
+names(wm)<-names(aom)
+names(ww)<-names(aom)
+```
+Now we can create the composite data frame.
+```{r}
+tennis<-rbind(aom,aow,fom,fow,uom,uow,wm,ww)
+```
+It is useful to have relevant columns converted to factors when creating plots and creating models.
+```{r}
+tennis$Gender<-as.factor(tennis$Gender)
+tennis$Slam<-as.factor(tennis$Slam)
+tennis$Result<-as.factor(tennis$Result)
+```
+As discussed above, we want certain columns to be averaged over the number of sets in each match. The last command is necessary because there are 4 rows where the number of recorded sets is zero or 1, and dividing by zero to find averages causes problems.
+```{r}
+setnum<-5-(is.na(tennis$ST1.1)+is.na(tennis$ST2.1)+is.na(tennis$ST3.1)+is.na(tennis$ST4.1)+is.na(tennis$ST5.1))
+tennisavg<-tennis
+for(i in c(8,10:19,26,28:37)){tennisavg[[i]]<-tennisavg[[i]]/setnum}
+tennisavg<-tennisavg[setnum>1,]
+```
+Now we must select the relevant columns for the analysis. Intuitively, we want the model to only use the score of the first set and information about a player's actual playing style (e.g. aces, winners and first serve percentages) for our possible predictors for two reasons. Firstly, it is most helpful to tennis players if the predictors are actionable areas of their game. Secondly, we can assume that the defining characteristics of a player's game (e.g. big server) will fluctuate less set by set than more general metrics of the number of points won. This means that average values will be better approximations of the true data from set one.
+```{r}
+tennisavg2<-tennisavg[,c(3,4,7,11:14,17,20,25,29:32,35,38,43,44)]
+```
+It will also be necessary to split the data into training and test (50/50 is chosen here). NA values will be dropped now to make the coding later on more clear and simple.
+```{r}
+set.seed(1)
+n<-nrow(tennisavg2)
+testrows<-sample(1:n,size=floor(n/2))
+test<-drop_na(tennisavg2[testrows,])
+training<-drop_na(tennisavg2[-testrows,])
+```
+From the three boxplots we can make the following conclusions:
+a) Players make fewer unforced errors at wimbledon 
+b) Players come to the net more at wimbledon
+c) More break points are created at wimbledon
+```{r}
+par(mfrow=c(2,2))
+boxplot(UFE.1~Slam,tennis)
+boxplot(NPA.1~Slam,tennis)
+boxplot(BPC.1~Slam,tennis)
+```
+We now analyse the mean first serve percentage. First, a simple t-test of whether players average higher than 50% of their first serves in. Since the p-value is almost zero we reject the null hypothesis that the average percentage is 50% and conclude that the true average first serve rate is greater than 50%.
+```{r}
+tvector<-c(tennis$FSP.1,tennis$FSP.2)
+t.test(tvector,mu=50,alt="greater",conf=0.95)
+```
+Now a two sample t-test of whether men and women have the same first serve percentage. At the 1% significance level, since the p-value is about 0.5%, we reject the null hypothesis that they have the same first serve rates and conclude that the first serve rate differs between men and women.
+```{r}
+serveframe<-data.frame(FSP.1=tvector,Gender=c(tennis$Gender,tennis$Gender))
+
+serveframe$Gender<-factor(serveframe$Gender,levels=c(1,2),labels=c("female","male"))
+
+t.test(FSP.1~Gender,mu=0,alt="two.sided",data=serveframe)
+```
+We now move on to exploring which variables may be good predictors of the winner of the tennis match.
+Here, four of the most intuitive predictors have been illustrated as overlapping histograms where the purple section is common to both histograms. The less the two histograms overlap in each graph, the greater the changes in the ratios of wins to losses for player 1 as the plotted variable increases. Therefore less overlap implies a more viable predictor.
+```{r}
+par(mfrow=c(2,2))
+
+hist(subset(tennisavg,Result==1)$WNR.1, col="blue",
+     xlab="player 1's winners",main="WNR.1 when player 1 wins vs loses")
+hist(subset(tennisavg,Result==0)$WNR.1, col=rgb(1,0,0,0.5), add=T)
+
+hist(subset(tennisavg,Result==1)$WNR.2, col="blue",
+     xlab="player 2's winners",main="WNR.2 when player 1 wins vs loses")
+hist(subset(tennisavg,Result==0)$WNR.2, col=rgb(1,0,0,0.5), add=T)
+
+hist(subset(tennisavg,Result==1)$UFE.1, col="blue",
+     xlab="player 1's unforced errors",main="UFE.1 when player 1 wins vs loses")
+hist(subset(tennisavg,Result==0)$UFE.1, col=rgb(1,0,0,0.5), add=T)
+
+
+hist(subset(tennisavg,Result==1)$UFE.2, col="blue",
+     xlab="player 2's unforced errors",main="UFE.2 when player 1 wins vs loses")
+hist(subset(tennisavg,Result==0)$UFE.2, col=rgb(1,0,0,0.5), add=T)
+```
+In all four graphs, we see significant divergence from fully overlapping histograms so it seems that both the average number of winners and unforced errors could predict whether player 1 wins.
+
+We quickly check whether other variables could be good predictors using simple boxplots. Only variables for player 1 are included. The assumption is that if the number of aces hit by player 1 changes the probability that he/she wins then his/her prospects are also affected by the number of aces hit by player 2.
+```{r}
+par(mfrow=c(2,2))
+boxplot(FSP.1~Result,data=tennisavg,horizontal=T)
+boxplot(ACE.1~Result,data=tennisavg,horizontal=T)
+boxplot(DBF.1~Result,data=tennisavg,horizontal=T)
+boxplot(NPA.1~Result,data=tennisavg,horizontal=T)
+```
+We see that these variables seem to be less good predictors. This is because the medians for cases where player 1 wins and loses varies only by a couple of units. Therefore the two distributions for each variable overlap significantly.
+
+Now we test for collinearity between the predictors using a correlation plot. Clearly the only significant correlation is between winners and aces hit by both players 1 and 2. We will see that the number of aces does not make it as a predictor in any of the following models so collinearity is not an important issue in this analysis.
+```{r}
+tennisavg3<-drop_na(tennisavg2)[-c(17,18,2,1)]
+corrplot(cor(tennisavg3))
+```
+For this classification problem, we use the logistic framework to create our first models. This is preferred to the linear framework because it more accurately describes the conditional probability of player 1 winning given predictor information. For example, it always predicts values between 0 and 1 unlike linear models.
+
+We first use asingle predictor: the number of winners hit per set by player 1. The glm() function then uses traditional maximum likelihood to select the appropriate coefficient values. The z value of the predictor coefficient has a corresponding p-value that is below 0.001 so this coefficient is significantly different from zero at even the 0.1% level. Therefore, player 1's average number of winners indeed affects the probability that they win the match.
+```{r}
+model1<-glm(Result~WNR.1,data=training,family=binomial)
+summary(model1)
+```
+
+We can illustrate this simple model graphically along with the 95% confidence intervals for the true conditional probabilities.
+```{r}
+input<-0:23
+forgraph<-data.frame(WNR.1=input)
+predmodel1<-predict(model1,forgraph,se.fit=TRUE,type="resp")
+forgraph1<-data.frame(forgraph,prediction=predmodel1$fit,se=predmodel1$se.fit)
+UB1<-predmodel1$fit+1.96*predmodel1$se.fit
+LB1<-predmodel1$fit-1.96*predmodel1$se.fit
+plot(as.integer(Result)-1~WNR.1,data=training)
+lines(x=input,y=predmodel1$fit)
+lines(x=input,y=UB1,lty="dashed",lwd=1.5)
+lines(x=input,y=LB1,lty="dashed",lwd=1.5)
+```
+
+Intuitively, if the average number of winners hit by player 1 increases the probability that they win, then the average number of winners scored by player 2 will decrease the probability of player 1 winning. We test the theory by incorporating this variable as a second predictor. Indeed, the new predictor is significantly different from zero because of the almost 0 p-value and the coefficient is negative as expected.
+```{r}
+model2<-glm(Result~WNR.1+WNR.2,data=training,family=binomial)
+summary(model2)
+```
+Now we create a model using all 17 predictors so overfitting is likely but this complicated model provides a useful benchmark to compare simpler models to.
+```{r}
+model3<-glm(Result~.,data=training,family=binomial)
+summary(model3)
+```
+The fourth model builds on the third by selecting only the variables whose coefficients were significantly different from zero at the 1% significance level.
+```{r}
+model4<-glm(Result~NPA.1+NPA.2+WNR.1+WNR.2+UFE.1+UFE.2,data=training,family=binomial)
+summary(model3)
+```
+Finally, one may expect the score of set 1 to be a good predictor of who wins the match. This information is included in the final logistic model.
+```{r}
+model5<-glm(Result~ST1.1+ST1.2+WNR.1+WNR.2+UFE.1+UFE.2,data=training,family=binomial)
+summary(model4)
+```
+We can use 10-fold cross validation on each of these 5 models to see which one has the lowest misclassification rate. This criteria will enable us to select our optimal model.
+```{r}
+set.seed(1)
+cv1 <- train(
+  Result ~ WNR.1, 
+  data = training, 
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 10)
+)
+
+set.seed(1)
+cv2 <- train(
+  Result ~ WNR.1+WNR.2, 
+  data = training, 
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 10)
+)
+
+set.seed(1)
+cv3 <- train(
+  Result ~ ., 
+  data = training, 
+  method = "glm",
+  family = "binomial",
+  trControl = trainControl(method = "cv", number = 10)
+)
+
+set.seed(1)
+cv4 <- train(
+  Result ~ WNR.1+WNR.2+UFE.1+UFE.2+NPA.1+NPA.2, 
+  data = training, 
+  method = "glm",
+  family="binomial",
+  trControl = trainControl(method = "cv", number = 10)
+)
+
+set.seed(1)
+cv5 <- train(
+  Result ~ WNR.1+WNR.2+UFE.1+UFE.2+ST1.1+ST1.2, 
+  data=training,
+  method = "glm",
+  family="binomial",
+  trControl = trainControl(method = "cv", number = 10)
+)
+
+model_set = list(
+  model1 = cv1, 
+  model2 = cv2, 
+  model3 = cv3,
+  model4 = cv4,
+  model5 = cv5
+)
+results <- 1-data.frame(summary(resamples(model_set))$statistics$Accuracy)
+plot(results$Mean,ylim=c(0.05,0.45))
+arrows(1:5, results$X3rd.Qu., 1:5, results$X1st.Qu., length=0.05, angle=90, code=3)
+```
+Note that the error bars represent the interquartile ranges of the cross-validation misclassification rates to approximate a 95% confidence interval for the true test misclassification rates of each model.
+
+We see that model 4 scores the lowest cv misclassification rate so we select model 4 as our best logistic model.
+We now see that when applying model 4 to the test data our misclassification rate is 13.7%.
+```{r}
+pred<-ifelse(predict(model4,newdata = test,type="resp")>0.5,1,0)
+table(predicted=pred,actual=test$Result)
+(34+19)/(168+34+19+165)
+```
+```{r}
+coef(model4)
+```
+We can also interpret the coefficients of model 4 in a little more mathematical depth. In logistic regression, the odds refers to the number of times more likely it is that player 1 rather than player 2 wins. The 'player 1's average winners hit' coefficient of 0.681 means that if player 1 hits one extra winner per set, their win to loss probability ratio is multiplied by a factor of e^0.681=1.98. In other words the odds increase, which implies that the probability player 1 wins must increase and the probability that player 1 loses must decrease by the same magnitude.
+
+Note that the negative coefficients, such as -0.810 for player 2's winners implies that the odds are multiplied by a fraction when player 2 hits an extra winner per set which in turn implies that the probability that player 1 wins must decrease and hence the probability that player 1 loses must increase by the same magnitude.
+
+Summarising this analysis, tennis players can learn that hitting extra winners, hitting fewer unforced errors and going to the net more frequently can improve their prospects. However, they should strategically seek to prevent their opponents from hitting winners and going to the net while encouraging their opponents to hit more unforced errors for instance by using defensive sliced shots in long rallies.
+
+It is worth mentioning that all the variables included in model 4 are approximately normally distributed with the exception of net points attempted. The natural log of net points attempted is far closer to a normal distribution so model 4 could potentially be improved further by using this logged variable.
+```{r}
+par(mfrow=c(1,3))
+hist(tennisavg$WNR.1)
+hist(tennisavg$NPA.1)
+hist(log(tennisavg$NPA.1))
+```
+
+Now we build a decision tree on the training dataset with all relevant predictors available. From the summary we can see that the misclassification rate on the training data is 6.8%
+```{r}
+tree1<-tree(Result~.,training)
+summary(tree1)
+```
+However, when this tree is applied to the test dataset to classify observations into player 1 wins and losses the misclassification rate shoots up to 24.3%. This is characteristic of overfitting, where too many branches and nodes are used in the tree so we have been fitting to the noise in the data.
+```{r}
+set.seed(1)
+table(predicted=predict(tree1,test,type="class"),actual=test$Result)
+(52+42)/(52+42+145+147)
+```
+
+Next, we use the cv.tree() function to prune our tree. We do this by increasing the cost-complexity parameter k to cause the optimum size of our tree to decrease. At each size tree, the default 10-fold cross validation is used to approximate the test misclassification rate for each sized tree. We see the classic relationship between flexibility (tree size) and misclassification rate in the graph and the console output confirms that a tree with 4 terminal nodes performs best out of the trees we tested.
+```{r}
+set.seed(1)
+cvtree<-cv.tree(tree1,FUN=prune.misclass)
+print(cvtree)
+plot(cvtree$size, cvtree$dev, type = "b")
+```
+Now we prune our tree to a size of four terminal nodes based on the cross validation analysis above. We see our training misclassification rate is 16.7% which seems worse than the 6.8% we had from our larger tree. However this is expected because we use a smaller tree and hence a less flexible model.
+```{r}
+pruned<- prune.misclass(tree1, best = 4)
+summary(pruned)
+```
+When testing our pruned tree on the test data it is revealed that it is indeed better than the initial tree because we record an 18.1% test misclassification rate compared with 24.3% above. Therefore, the probability of guessing who won a new tennis match correctly is greater under the simpler decision tree model.
+```{r}
+set.seed(1)
+table(predicted=predict(pruned,test,type="class"),actual=test$Result)
+(33+37)/(154+37+33+162)
+```
+Because this tree is simpler, we can also interpret it more easily. The tree is shown below in its diagrammatical form. Interestingly, this model uses only the first set score information to classify who wins.
+```{r}
+plot(pruned)
+text(pruned, pretty = 0)
+```
+However, as well as using a single tree, you can also take many bootstrapped datasets from the training data and take the average of the trees created from each dataset. We begin with the so called bagging method, which includes all potential predictors in each bootstrapped tree, and we stick to the default of 500 bootstraps. Using out of bag predictions as cross validation we get a misclassification rate of 17%.
+```{r}
+set.seed(1)
+p <- ncol(training)-1
+bagging<- randomForest(Result~ .,data=training,mtry=p,importance=TRUE)
+print(bagging)
+```
+Now we see how taking more bootstrapped trees affects the out of bag performance. We see that performance increases as you take more trees and stabilises after about 200 trees.
+```{r}
+set.seed(1)
+baggingtrees<-randomForest(Result~., data = training, mtry=p)
+plot(baggingtrees$err.rate[,1], xlab="N Trees", ylab="MCR")
+```
+To be safe we can choose 400 as our optimal number of trees (but realistically could take any number greater than 200). We see a 17.28% cv misclassification rate which is about the same as the 17% we received when using 500 trees.
+```{r}
+set.seed(1)
+bagging2<- randomForest(Result~ .,data=training,mtry=p,importance=TRUE,ntree=400)
+print(bagging2)
+```
+We finish by testing the 400 tree model on the test dataset and receive a misclassification rate of 17.3%. 
+```{r}
+set.seed(1)
+table(predicted=predict(bagging2,test,type="class"),actual=test$Result)
+(40+27)/(160+159+40+27)
+```
+Now we move onto applying the random forest method to the training dataset. This involves reducing the number of predictors chosen for each bootstrapped tree from the full 17 and selecting them at random for each bootstrapped tree. We begin with a selection of 6 predictors and assume that 400 is still a suitable number of trees to use. The out of bag error here is 17.56%.
+```{r}
+set.seed(1)
+forest <- randomForest(Result ~ ., data = drop_na(training), mtry = 6, importance = TRUE,ntree=400)
+print(forest)
+```
+It would be very useful to find the optimal number of predictors to use for each tree in our random forest.
+From the graph we see that using 1 or 3 predictors in the random forest tends to give the lowest misclassification rates. 
+```{r}
+set.seed(1)
+    x<-randomForest(Result~., data = training, mtry=1,ntree=2000)
+    plot(x$err.rate[,1], xlab="N Trees", ylab="MCR",type="l",col=4,ylim=c(0.15,0.2))
+
+for(i in c(3,6,10,17)){ 
+    x<-randomForest(Result~., data = training, mtry=i,ntree=2000)
+    lines(x$err.rate[,1], xlab="N Trees", ylab="MCR",col=i)
+  
+}
+      legend(1700,0.2,legend = c("1","3","6","10","17"),col=c("blue","green","deeppink","red","black"),lty=1)
+```
+Indeed, using a for loop to find the lowest misclassification rate for each number of predictors, we find that 2 predictors gives the lowest minimum.
+```{r}
+set.seed(1)
+z<-numeric()
+for(i in 1:17){
+optimaltest<-randomForest(Result~., data = training, mtry=i,ntree=2000)
+z<-c(z,min(optimaltest$err.rate[,1]))
+}
+which.min(z)
+```
+Now let's find the optimal number of trees with 2 predictors in the random forest. We see that this is 983 trees.
+```{r}
+set.seed(1)
+optimaltest2<-randomForest(Result~., data = training, mtry=2,ntree=2000)
+which.min(optimaltest$err.rate[,1])
+```
+We now build and evaluate this optimal decision tree. We receive a test misclassification rate of 16.8%
+```{r}
+set.seed(1)
+optimal<-randomForest(Result~., data = training, mtry=2,ntree=983)
+table(predicted=predict(optimal,test,type="class"),actual=test$Result)
+(41+24)/(163+158+41+24)
+```
+Using the boosted decision tree method with a size of 3, 4000 trees and a lambda learning rate of 0.01, we plot training and cv misclassification rates and observe the usual pattern, with overfitting occuring beyond the blue vertical line.
+```{r}
+X.train = dplyr::select(training,-Result)
+Y.train = training$Result
+
+X.test = dplyr::select(test,-Result)
+Y.test = test$Result
+
+set.seed(1)
+boost.tree = gbm(Y.train ~ . , data = X.train, distribution = "multinomial",
+                   n.trees = 4000, shrinkage = 0.01, interaction.depth = 3, cv.folds = 4)
+
+ntree_best <- gbm.perf(boost.tree, method="cv")
+```
+We see that the optimal tree from boosting given the specified parameters includes 601 trees and has a cv misclassification rate of 30.8%. However it is likely that varying the lambda learning rate could significantly improve this value.
+```{r}
+boost.tree$cv.error[ntree_best]
+ntree_best
+```
+Finally, we compare the test misclassification rates of the best models that have been developed in this investigation. Clearly the logistic model performs the best, however the boosted decision tree is not fully optimised so perhaps it could rival the logistic model. The logistic model does also have the second advantage of interpretability. The coefficient values can give tennis players recommendations on what areas to work on in addition to simply predicting whether or not they will win.
+```{r}
+data.frame(bestlogistic=13.7,bestprunedtree=18.1,bestbaggedtree=17.4,bestrandomforest=16.8,boostedtree=30.1)
+```
+
+
+
+
+
+
+
+
+
